@@ -120,6 +120,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     count: number;
     now: Date;
     withRunComments?: boolean;
+    commentBody?: (index: number, run: typeof heartbeatRuns.$inferInsert) => string;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
@@ -150,7 +151,7 @@ describeEmbeddedPostgres("productivity review service", () => {
           issueId: input.issueId,
           authorAgentId: input.agentId,
           createdByRunId: run.id,
-          body: `Progress update ${index}`,
+          body: input.commentBody?.(index, run) ?? `Progress update ${index}`,
           createdAt: run.createdAt as Date,
           updatedAt: run.createdAt as Date,
         })),
@@ -158,6 +159,35 @@ describeEmbeddedPostgres("productivity review service", () => {
     }
 
     return runs;
+  }
+
+  function liveSessionMetricSnapshot(index: number) {
+    const sampleCount = 40 - index * 2;
+    const snapshotCount = 61_000 - index * 820;
+    const timingRows = 1_070 - index * 52;
+    const wallMs = 900 + index * 37;
+    const calibration = (3.9 - index * 0.07).toFixed(3);
+    return [
+      `Capture still running: v8 [HAT-1441](/HAT/issues/HAT-1441) py-spy dump-loop metrics at \`2026-05-12T00:${23 - index}:05Z\`.`,
+      "",
+      "- Process: live PID `112517` alive `True`; py-spy loop PID `112752` alive `True`; supervisor PID `112514` alive `True`.",
+      "- Egg: `data/eggs/2026-05-12_000307_modular_mm_BTC-ETH-SOL-BNB-XRP/`.",
+      `- py-spy: \`${sampleCount}\` samples, artifact size \`384K\`; trace WAL \`${34 + index}M\`.`,
+      "- PnL: total `0.000`, realized `0.000`, unrealized `0.000`, exposure `0.000`.",
+      "- Fills: fill rows `0`, `mmm_fill` rows `0`, volume `0.000000`, notional `0.00`; by side: none.",
+      "- Orders: `0` rows; by status: none.",
+      "- Inventory: BTC `0.000000`, ETH `0.000000`, SOL `0.000000`, BNB `0.000000`, XRP `0.000000`.",
+      `- Calibration lambda bid/ask: BTC \`${calibration}/1.142\`, ETH \`6.161/2.014\`, SOL \`2.433/1.253\`, BNB \`4.213/1.671\`, XRP \`1.167/0.538\`.`,
+      "- Warmup: BTC cal `1` agg `0`, ETH cal `1` agg `0`, SOL cal `1` agg `0`, BNB cal `1` agg `0`, XRP cal `1` agg `0`.",
+      `- Trace: snapshots \`${snapshotCount}\`, source-2 snapshots \`${5_500 - index * 231}\`, \`heartbeat_timing_v1\` \`${timingRows}\`.`,
+      `- Heartbeat timing: latest wall \`${wallMs.toFixed(3)}ms\`, latest engine snapshot \`0.000ms\`, max wall \`2872.020ms\`, mean wall \`911.368ms\`, over-1s \`${277 - index}\`, over-5s \`0\`.`,
+      "- Event counts: kelly=55643, tick_freshness_v1=1347, heartbeat_timing_v1=1074, MARKET_DATA_FEED_LOSS=1.",
+      "",
+      "Notable log lines:",
+      "- `FATAL_STALE: no market data across subscribed assets for 30s -- canceling ALL orders`",
+      "",
+      "Next action: continue monitoring until the dump-loop deadline around `2026-05-12T01:18:07Z`; then inspect the py-spy distribution plus `heartbeat_timing_v1` and record final evidence on [HAT-1438](/HAT/issues/HAT-1438).",
+    ].join("\n");
   }
 
   async function listProductivityReviews(companyId: string) {
@@ -380,6 +410,52 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `high_churn`");
     expect(review?.description).toContain("Runs in rolling windows: 10/1h");
+  });
+
+  it("does not create a high-churn review for fresh mandated live-session metric cadence", async () => {
+    const now = new Date("2026-05-12T00:23:05.000Z");
+    const seeded = await seedAssignedIssue({ startedAt: new Date(now.getTime() - 10 * 60 * 1000) });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+      commentBody: (index) => liveSessionMetricSnapshot(index),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("still creates a high-churn review for repeated live-session comments without fresh metrics", async () => {
+    const now = new Date("2026-05-12T00:23:05.000Z");
+    const seeded = await seedAssignedIssue({ startedAt: new Date(now.getTime() - 10 * 60 * 1000) });
+    const repeatedSnapshot = liveSessionMetricSnapshot(0);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+      commentBody: () => repeatedSnapshot,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
   });
 
   it("ignores non-assignee comments when evaluating high-churn productivity reviews", async () => {

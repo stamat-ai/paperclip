@@ -32,7 +32,25 @@ const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
+const LIVE_CADENCE_MIN_SNAPSHOTS = 10;
+const LIVE_CADENCE_MAX_WINDOW_MS = 20 * 60 * 1000;
+const LIVE_CADENCE_MAX_AVERAGE_INTERVAL_MS = 2 * 60 * 1000;
+const LIVE_CADENCE_MIN_METRIC_GROUPS = 5;
+const LIVE_CADENCE_MIN_NUMERIC_TOKENS = 10;
+const LIVE_CADENCE_MIN_UNIQUE_SIGNATURE_RATIO = 0.8;
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
+
+const LIVE_SESSION_METRIC_PATTERNS = [
+  /\bpnl\b|realized|unrealized|exposure/i,
+  /\bfills?\b|fill rows|volume|notional|by side/i,
+  /\borders?\b|order rows|by status/i,
+  /\binventory\b|position/i,
+  /\bcalibration\b|lambda|\u03bb|warmup|params?/i,
+  /\bpid\b|process|alive|supervisor|container/i,
+  /\bartifact\b|egg|trace|wal|samples?|snapshots?|file|path|py-spy|profile/i,
+  /\bheartbeat timing\b|latency|wall|mean|max|over-\d/i,
+  /\bevent counts?\b|notable events?|notable log lines?|log lines/i,
+] as const;
 
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
@@ -132,6 +150,63 @@ function readPositiveInteger(value: number, fallback: number) {
 function coerceDate(value: Date | string | null | undefined) {
   if (!value) return null;
   return value instanceof Date ? value : new Date(value);
+}
+
+function countMetricGroups(body: string) {
+  return LIVE_SESSION_METRIC_PATTERNS.reduce((count, pattern) => count + (pattern.test(body) ? 1 : 0), 0);
+}
+
+function metricNumericTokens(body: string) {
+  const normalized = body
+    .replace(/\[[A-Z]+-\d+\]\([^)]*\)/g, "")
+    .replace(/\b[A-Z]+-\d+\b/g, "")
+    .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/g, "")
+    .replace(/\b\d{2}:\d{2}:\d{2}Z?\b/g, "")
+    .replace(/\b(?:live|py-spy loop|supervisor)?\s*pid\s*`?\d+`?/gi, "pid");
+  return normalized.match(/[-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?/gi) ?? [];
+}
+
+function metricNumericSignature(body: string) {
+  return metricNumericTokens(body).slice(0, 80).join("|");
+}
+
+function hasBoundedNextAction(body: string) {
+  const match = body.match(
+    /(?:^|\n)\s*(?:[-*]\s*)?(?:next action|next step|stop condition|deadline)\s*:\s*([^\n]+)/i,
+  );
+  const action = match?.[1]?.trim() ?? "";
+  if (action.length < 20) return false;
+  return /\b(until|deadline|then|after|before|by|at|final|summari[sz]e|complete|stop|close|record)\b/i.test(action);
+}
+
+function isMetricSnapshotComment(comment: typeof issueComments.$inferSelect) {
+  const body = comment.body;
+  return (
+    hasBoundedNextAction(body) &&
+    countMetricGroups(body) >= LIVE_CADENCE_MIN_METRIC_GROUPS &&
+    metricNumericTokens(body).length >= LIVE_CADENCE_MIN_NUMERIC_TOKENS
+  );
+}
+
+function isMandatedLiveSessionCadence(input: {
+  latestComments: Array<typeof issueComments.$inferSelect>;
+  thresholds: ProductivityReviewThresholds;
+}) {
+  const requiredSnapshots = Math.max(LIVE_CADENCE_MIN_SNAPSHOTS, input.thresholds.highChurnHourly);
+  const snapshotWindow = input.latestComments.slice(0, requiredSnapshots);
+  if (snapshotWindow.length < requiredSnapshots) return false;
+  if (!snapshotWindow.every(isMetricSnapshotComment)) return false;
+
+  const sorted = [...snapshotWindow].sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime());
+  const windowMs = sorted[sorted.length - 1]!.createdAt.getTime() - sorted[0]!.createdAt.getTime();
+  const averageIntervalMs = windowMs / Math.max(1, sorted.length - 1);
+  if (windowMs > LIVE_CADENCE_MAX_WINDOW_MS || averageIntervalMs > LIVE_CADENCE_MAX_AVERAGE_INTERVAL_MS) {
+    return false;
+  }
+
+  const signatures = new Set(snapshotWindow.map((comment) => metricNumericSignature(comment.body)).filter(Boolean));
+  const minUniqueSignatures = Math.ceil(snapshotWindow.length * LIVE_CADENCE_MIN_UNIQUE_SIGNATURE_RATIO);
+  return signatures.size >= minUniqueSignatures;
 }
 
 function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): ProductivityReviewThresholds {
@@ -425,6 +500,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       noCommentStreak += 1;
     }
 
+    const latestCommentLimit = Math.max(5, LIVE_CADENCE_MIN_SNAPSHOTS, thresholds.highChurnHourly);
     const [
       runCountLastHour,
       runCountLastSixHours,
@@ -454,7 +530,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           ),
         )
         .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
-        .limit(5)
+        .limit(latestCommentLimit)
         .then((rows) => rows.map((row) => row.comment)),
       db
         .select({ costCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::int` })
@@ -473,11 +549,17 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
-    const highChurn =
+    const rawHighChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
       runCountLastSixHours >= thresholds.highChurnSixHours ||
       assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
+    const hasMandatedCadenceEvidence =
+      assigneeRunCommentCountLastHour >= thresholds.highChurnHourly &&
+      isMandatedLiveSessionCadence({ latestComments, thresholds });
+    // Some companies require live-session operators to post metric snapshots every 60s.
+    // Those comments can exceed raw churn thresholds while still carrying fresh bounded progress.
+    const highChurn = rawHighChurn && !hasMandatedCadenceEvidence;
     const trigger = choosePrimaryTrigger({ noComment, longActive, highChurn });
     if (!trigger) return null;
 
