@@ -2369,6 +2369,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(
         and(
           eq(heartbeatRuns.companyId, input.run.companyId),
+          eq(heartbeatRuns.agentId, input.run.agentId),
           inArray(heartbeatRuns.id, ownerRunIds),
           inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
         ),

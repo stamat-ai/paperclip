@@ -2888,6 +2888,139 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("keeps cross-agent active issue owners as checkout conflicts", async () => {
+    const { agentId, issueId, runId, wakeupRequestId, companyId } = await seedRunFixture({
+      agentStatus: "idle",
+      runStatus: "queued",
+    });
+    const otherAgentId = randomUUID();
+    const otherWakeupId = randomUUID();
+    const otherRunId = randomUUID();
+    const now = new Date("2026-03-19T00:00:30.000Z");
+
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        reason: "issue_monitor_due",
+        status: "queued",
+        payload: { issueId },
+      })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        invocationSource: "automation",
+        triggerDetail: "system",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_monitor_due",
+          source: "issue.monitor",
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "OtherAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: otherWakeupId,
+      companyId,
+      agentId: otherAgentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "claimed",
+      runId: otherRunId,
+      claimedAt: now,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId: otherAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      wakeupRequestId: otherWakeupId,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      startedAt: now,
+      updatedAt: now,
+    });
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: otherRunId,
+        executionRunId: otherRunId,
+        executionAgentNameKey: "otheragent",
+        executionLockedAt: now,
+      })
+      .where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    mockAdapterExecute.mockClear();
+
+    await heartbeat.resumeQueuedRuns();
+
+    const conflictedRun = await waitForValue(async () => {
+      const row = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return row && row.status === "failed" ? row : null;
+    }, 5_000);
+    expect(conflictedRun).toMatchObject({
+      status: "failed",
+      errorCode: "adapter_failed",
+      error: "Issue checkout conflict",
+    });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const currentWakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(currentWakeup).toMatchObject({
+      status: "failed",
+      runId,
+      error: "Issue checkout conflict",
+    });
+
+    const ownerRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, otherRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(ownerRun).toMatchObject({
+      status: "running",
+      agentId: otherAgentId,
+    });
+
+    const issue = await db
+      .select({
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toEqual({
+      assigneeAgentId: agentId,
+      checkoutRunId: otherRunId,
+      executionRunId: otherRunId,
+    });
+  });
+
   it("observes a productive continuation retry without creating a stranded recovery blocker", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
