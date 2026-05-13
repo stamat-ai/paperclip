@@ -203,6 +203,7 @@ const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_r
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+const ACTIVE_ISSUE_EXECUTION_SUPPRESSED_ERROR_CODE = "issue_active_execution_already_running";
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -2339,6 +2340,107 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const recovery = recoveryService(db, { enqueueWakeup });
   const productivityReviews = productivityReviewService(db, { enqueueWakeup });
   let unsafeTextProjectionPromise: Promise<boolean> | null = null;
+
+  async function findActiveSameAgentIssueExecutionOwner(input: {
+    issueId: string;
+    run: typeof heartbeatRuns.$inferSelect;
+  }) {
+    const issue = await db
+      .select({
+        id: issues.id,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.run.companyId)))
+      .then((rows) => rows[0] ?? null);
+
+    if (!issue || issue.status !== "in_progress" || issue.assigneeAgentId !== input.run.agentId) return null;
+
+    const ownerRunIds = [...new Set([issue.executionRunId, issue.checkoutRunId])]
+      .filter((runId): runId is string => Boolean(runId && runId !== input.run.id));
+    if (ownerRunIds.length === 0) return null;
+
+    return db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.run.companyId),
+          inArray(heartbeatRuns.id, ownerRunIds),
+          inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+        ),
+      )
+      .orderBy(
+        sql`case when ${heartbeatRuns.status} = 'running' then 0 else 1 end`,
+        asc(heartbeatRuns.createdAt),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function suppressRunBehindActiveIssueExecution(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    issueId: string;
+    activeOwnerRun: typeof heartbeatRuns.$inferSelect;
+  }) {
+    const now = new Date();
+    const message = "Skipped because another active run for the same agent already owns this issue";
+    const contextSnapshot = {
+      ...parseObject(input.run.contextSnapshot),
+      issueId: input.issueId,
+      suppressedByActiveIssueRunId: input.activeOwnerRun.id,
+      suppressionReason: "active_same_agent_issue_execution",
+    };
+    const resultJson = {
+      ...parseObject(input.run.resultJson),
+      stopReason: ACTIVE_ISSUE_EXECUTION_SUPPRESSED_ERROR_CODE,
+      suppressedByActiveIssueRunId: input.activeOwnerRun.id,
+      effectiveTimeoutSec: 0,
+      timeoutConfigured: false,
+      timeoutSource: "issue_execution_serialization",
+      timeoutFired: false,
+    };
+
+    const updated = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        finishedAt: now,
+        error: message,
+        errorCode: ACTIVE_ISSUE_EXECUTION_SUPPRESSED_ERROR_CODE,
+        resultJson,
+        contextSnapshot,
+        updatedAt: now,
+      })
+      .where(and(eq(heartbeatRuns.id, input.run.id), inArray(heartbeatRuns.status, ["queued", "running"])))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+
+    if (!updated) return null;
+
+    await setWakeupStatus(updated.wakeupRequestId, "coalesced", {
+      runId: input.activeOwnerRun.id,
+      finishedAt: now,
+      error: message,
+    });
+
+    await appendRunEvent(updated, await nextRunEventSeq(updated.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message,
+      payload: {
+        issueId: input.issueId,
+        activeOwnerRunId: input.activeOwnerRun.id,
+        activeOwnerRunStatus: input.activeOwnerRun.status,
+      },
+    });
+
+    return updated;
+  }
 
   async function releaseEnvironmentLeasesForRun(input: {
     runId: string;
@@ -6816,7 +6918,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
       } catch (error) {
         if (!isCheckoutConflictError(error)) throw error;
-        context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = false;
+        const activeOwnerRun = await findActiveSameAgentIssueExecutionOwner({ issueId, run });
+        if (activeOwnerRun) {
+          await suppressRunBehindActiveIssueExecution({ run, issueId, activeOwnerRun });
+          return;
+        }
+        throw error;
       }
       issueContext = await getIssueExecutionContext(agent.companyId, issueId);
     }

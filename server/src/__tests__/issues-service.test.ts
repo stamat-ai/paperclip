@@ -2931,6 +2931,89 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     return { issueId, runId };
   }
 
+  async function seedCheckedOutIssueWithRun(input: {
+    ownerStatus: string;
+  }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const issueId = randomUUID();
+    const ownerRunId = randomUUID();
+    const nextRunId = randomUUID();
+    const otherRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: agentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "OtherCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: ownerRunId,
+        companyId,
+        agentId,
+        status: input.ownerStatus,
+        invocationSource: "assignment",
+        contextSnapshot: { issueId },
+      },
+      {
+        id: nextRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "timer",
+        contextSnapshot: { issueId },
+      },
+      {
+        id: otherRunId,
+        companyId,
+        agentId: otherAgentId,
+        status: "running",
+        invocationSource: "timer",
+        contextSnapshot: { issueId },
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Live monitor",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    return { issueId, agentId, otherAgentId, ownerRunId, nextRunId, otherRunId };
+  }
+
   it("clears execution locks owned by terminal runs", async () => {
     const { issueId } = await seedIssueWithRun("failed");
 
@@ -2982,5 +3065,30 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row).toEqual({ executionRunId: null, executionLockedAt: null });
+  });
+
+  it("lets the same assignee adopt an in-progress issue after the previous checkout run is terminal", async () => {
+    const { issueId, agentId, nextRunId } = await seedCheckedOutIssueWithRun({ ownerStatus: "succeeded" });
+
+    const checkedOut = await svc.checkout(issueId, agentId, ["todo", "backlog", "blocked"], nextRunId);
+
+    expect(checkedOut).toMatchObject({
+      id: issueId,
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      checkoutRunId: nextRunId,
+      executionRunId: nextRunId,
+    });
+  });
+
+  it("keeps true cross-agent checkout conflicts rejected", async () => {
+    const { issueId, otherAgentId, otherRunId } = await seedCheckedOutIssueWithRun({ ownerStatus: "running" });
+
+    await expect(
+      svc.checkout(issueId, otherAgentId, ["todo", "backlog", "blocked"], otherRunId),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: "Issue checkout conflict",
+    });
   });
 });

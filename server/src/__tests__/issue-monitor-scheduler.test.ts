@@ -269,6 +269,93 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(activity).toContain("issue.monitor_triggered");
   });
 
+  it("coalesces a due monitor behind the active same-agent issue owner", async () => {
+    const { issueId, agentId, companyId } = await seedFixture();
+    const heartbeat = heartbeatService(db);
+    const activeRunId = randomUUID();
+    const activeWakeupId = randomUUID();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await db.insert(agentWakeupRequests).values({
+      id: activeWakeupId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "claimed",
+      runId: activeRunId,
+      claimedAt: new Date("2026-04-11T12:29:00.000Z"),
+    });
+    await db.insert(heartbeatRuns).values({
+      id: activeRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      wakeupRequestId: activeWakeupId,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      startedAt: new Date("2026-04-11T12:29:00.000Z"),
+    });
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: activeRunId,
+        executionRunId: activeRunId,
+        executionAgentNameKey: "monitor bot",
+        executionLockedAt: new Date("2026-04-11T12:29:00.000Z"),
+      })
+      .where(eq(issues.id, issueId));
+
+    try {
+      const result = await heartbeat.tickTimers(tickAt);
+
+      expect(result.enqueued).toBe(1);
+
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({
+        id: activeRunId,
+        status: "running",
+      });
+
+      const wakeups = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      const coalescedWakeup = wakeups.find((wakeup) => wakeup.status === "coalesced");
+      expect(coalescedWakeup).toMatchObject({
+        reason: "issue_execution_same_name",
+        runId: activeRunId,
+      });
+
+      const recoveryIssues = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.originId, issueId));
+      expect(recoveryIssues).toHaveLength(0);
+    } finally {
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, activeRunId));
+      await db
+        .update(issues)
+        .set({
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+        })
+        .where(eq(issues.id, issueId));
+    }
+  });
+
   it("lets the board trigger a scheduled issue monitor immediately", async () => {
     const { issueId, agentId, nextCheckAt } = await seedFixture();
     const heartbeat = heartbeatService(db);
