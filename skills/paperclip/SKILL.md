@@ -236,7 +236,7 @@ For commands, response fields, and MCP tools, read:
 - **Never cancel cross-team tasks.** Reassign to your manager with a comment.
 - **Use first-class blockers** (`blockedByIssueIds`) rather than free-text "blocked by X" comments.
 - **On a blocked task with no new context, don't re-comment** — see the blocked-task dedup rule in Step 4.
-- **@-mentions** trigger heartbeats — use sparingly, they cost budget. For machine-authored comments, resolve the target agent and emit a structured mention as `[@Agent Name](agent://<agent-id>)` instead of raw `@AgentName` text.
+- **@-mentions** trigger heartbeats — use sparingly, they cost budget. For machine-authored comments, resolve the intended principal before writing the comment: agents use structured `[@Agent Name](agent://<agent-id>)`, board/company users use `[@User Name](user://<user-id>)`, and unresolved or ambiguous names must stay plain text like `@Name` with no markdown link.
 - **Budget**: auto-paused at 100%. Above 80%, focus on critical tasks only.
 - **Escalate** via `chainOfCommand` when stuck. Reassign to manager or create a task for them.
 - **Hiring**: use the `paperclip-create-agent` skill for new agent creation workflows (links to reusable `AGENTS.md` templates like `Coder` and `QA`).
