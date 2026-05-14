@@ -7,6 +7,7 @@ import {
   agents,
   approvals,
   assets,
+  authUsers,
   companies,
   companyMemberships,
   documents,
@@ -41,6 +42,7 @@ import type {
   SuccessfulRunHandoffState,
 } from "@paperclipai/shared";
 import {
+  canonicalizeAgentMentionLinks,
   clampIssueRequestDepth,
   extractAgentMentionIds,
   extractProjectMentionIds,
@@ -49,6 +51,7 @@ import {
   issueCommentPresentationSchema,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+  type MentionDirectory,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -5265,6 +5268,41 @@ export function issueService(db: Db) {
         await tx.delete(assets).where(eq(assets.id, existing.assetId));
         return existing;
       }),
+
+    loadMentionDirectory: async (companyId: string): Promise<MentionDirectory> => {
+      const [agentRows, memberRows] = await Promise.all([
+        db.select({ id: agents.id, name: agents.name, status: agents.status })
+          .from(agents)
+          .where(eq(agents.companyId, companyId)),
+        db.select({ principalId: companyMemberships.principalId })
+          .from(companyMemberships)
+          .where(and(
+            eq(companyMemberships.companyId, companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.status, "active"),
+          )),
+      ]);
+
+      const userIds = [...new Set(memberRows.map((r) => r.principalId))];
+      const userRows = userIds.length > 0
+        ? await db.select({ id: authUsers.id, name: authUsers.name })
+            .from(authUsers)
+            .where(inArray(authUsers.id, userIds))
+        : [];
+
+      return {
+        agents: agentRows,
+        users: userRows.filter((u) => u.name).map((u) => ({ userId: u.id, name: u.name })),
+      };
+    },
+
+    canonicalizeCommentBody: async (companyId: string, body: string): Promise<string> => {
+      if (!body) return body;
+      const hasAgentLink = body.includes("agent://");
+      if (!hasAgentLink) return body;
+      const directory = await issueService(db).loadMentionDirectory(companyId);
+      return canonicalizeAgentMentionLinks(body, directory);
+    },
 
     findMentionedAgents: async (companyId: string, body: string) => {
       const re = /\B@([^\s@,!?.]+)/g;

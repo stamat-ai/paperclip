@@ -14,6 +14,7 @@ const mockIssueService = vi.hoisted(() => ({
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   findMentionedAgents: vi.fn(async () => []),
+  canonicalizeCommentBody: vi.fn(async (_companyId: string, body: string) => body),
 }));
 
 vi.mock("../services/index.js", () => ({

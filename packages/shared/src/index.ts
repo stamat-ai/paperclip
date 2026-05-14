@@ -1051,6 +1051,7 @@ export {
   buildSkillMentionHref,
   buildUserMentionHref,
   extractAgentMentionIds,
+  canonicalizeAgentMentionLinks,
   extractProjectMentionIds,
   extractSkillMentionIds,
   extractUserMentionIds,
@@ -1058,10 +1059,13 @@ export {
   parseProjectMentionHref,
   parseSkillMentionHref,
   parseUserMentionHref,
+  type AgentDirectoryEntry,
+  type MentionDirectory,
   type ParsedAgentMention,
   type ParsedProjectMention,
   type ParsedSkillMention,
   type ParsedUserMention,
+  type UserDirectoryEntry,
 } from "./project-mentions.js";
 
 export {

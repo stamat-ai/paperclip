@@ -11,6 +11,7 @@ const PROJECT_MENTION_LINK_RE = /\[[^\]]*]\((project:\/\/[^)\s]+)\)/gi;
 const AGENT_MENTION_LINK_RE = /\[[^\]]*]\((agent:\/\/[^)\s]+)\)/gi;
 const USER_MENTION_LINK_RE = /\[[^\]]*]\((user:\/\/[^)\s]+)\)/gi;
 const SKILL_MENTION_LINK_RE = /\[[^\]]*]\((skill:\/\/[^)\s]+)\)/gi;
+const AGENT_MENTION_LINK_WITH_LABEL_RE = /\[@([^\]]*)\]\((agent:\/\/[^)\s]+)\)/g;
 const AGENT_ICON_NAME_RE = /^[a-z0-9-]+$/i;
 const SKILL_SLUG_RE = /^[a-z0-9][a-z0-9-]*$/i;
 
@@ -229,4 +230,99 @@ function normalizeSkillSlug(input: string | null | undefined): string | null {
   const trimmed = input.trim().toLowerCase();
   if (!trimmed || !SKILL_SLUG_RE.test(trimmed)) return null;
   return trimmed;
+}
+
+// ---------------------------------------------------------------------------
+// Agent mention link canonicalization
+// ---------------------------------------------------------------------------
+
+export interface AgentDirectoryEntry {
+  id: string;
+  name: string;
+  status: string;
+}
+
+export interface UserDirectoryEntry {
+  userId: string;
+  name: string;
+}
+
+export interface MentionDirectory {
+  agents: AgentDirectoryEntry[];
+  users: UserDirectoryEntry[];
+}
+
+function isActiveAgent(entry: AgentDirectoryEntry): boolean {
+  return entry.status !== "terminated";
+}
+
+function labelMatchesAgent(label: string, agent: AgentDirectoryEntry): boolean {
+  const l = label.toLowerCase();
+  const name = agent.name.toLowerCase();
+  if (l === name) return true;
+  // Name-Role suffix form: e.g. "Stamat-CTO" matches agent named "Stamat"
+  if (l.includes("-")) {
+    const prefix = l.slice(0, l.lastIndexOf("-"));
+    if (prefix === name) return true;
+  }
+  // Name (Role) suffix form: e.g. "Stamat (CTO)" matches agent named "Stamat"
+  const parenMatch = l.match(/^(.+?)\s*\(.*\)$/);
+  if (parenMatch && parenMatch[1] === name) return true;
+  return false;
+}
+
+function resolveLabel(
+  label: string,
+  directory: MentionDirectory,
+): { type: "agent"; agent: AgentDirectoryEntry } | { type: "user"; user: UserDirectoryEntry } | null {
+  const activeAgents = directory.agents.filter(isActiveAgent);
+
+  // Exact or suffix match against agents
+  const agentMatches = activeAgents.filter((a) => labelMatchesAgent(label, a));
+  if (agentMatches.length === 1) return { type: "agent", agent: agentMatches[0] };
+
+  // Exact match against users
+  const l = label.toLowerCase();
+  const userMatches = directory.users.filter((u) => u.name.toLowerCase() === l);
+  if (userMatches.length === 1) return { type: "user", user: userMatches[0] };
+
+  return null;
+}
+
+/**
+ * Rewrites `[@Label](agent://id)` links in markdown so label and href agree.
+ *
+ * Returns the canonicalized markdown. The directory must include all active
+ * agents and board/company users so the function can resolve labels.
+ */
+export function canonicalizeAgentMentionLinks(markdown: string, directory: MentionDirectory): string {
+  if (!markdown) return markdown;
+  const re = new RegExp(AGENT_MENTION_LINK_WITH_LABEL_RE);
+  return markdown.replace(re, (fullMatch, label: string, href: string) => {
+    const parsed = parseAgentMentionHref(href);
+    if (!parsed) return fullMatch;
+
+    const hrefAgentId = parsed.agentId;
+    const resolved = resolveLabel(label, directory);
+
+    if (resolved?.type === "agent") {
+      // Rule 1/3: label resolved to an active agent — use that agent's canonical form
+      return `[@${resolved.agent.name}](${buildAgentMentionHref(resolved.agent.id)})`;
+    }
+
+    if (resolved?.type === "user") {
+      // Rule 2: label resolved to a user — rewrite to user://
+      return `[@${resolved.user.name}](${buildUserMentionHref(resolved.user.userId)})`;
+    }
+
+    // No unique resolution from the label. Check if the href target agent exists
+    // and the label is compatible with it (rule 3).
+    const hrefAgent = directory.agents.find((a) => a.id === hrefAgentId);
+    if (hrefAgent && isActiveAgent(hrefAgent) && labelMatchesAgent(label, hrefAgent)) {
+      return `[@${hrefAgent.name}](${buildAgentMentionHref(hrefAgent.id)})`;
+    }
+
+    // Rule 4: unknown, ambiguous, or incompatible — strip href, make inert
+    return `@${label}`;
+  });
 }

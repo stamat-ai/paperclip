@@ -23,6 +23,7 @@ const mockIssueService = vi.hoisted(() => ({
   removeAttachment: vi.fn(),
   update: vi.fn(),
   findMentionedAgents: vi.fn(),
+  canonicalizeCommentBody: vi.fn(async (_companyId: string, body: string) => body),
 }));
 
 const mockAccessService = vi.hoisted(() => ({

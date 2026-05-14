@@ -3358,10 +3358,13 @@ export function issueRoutes(
     }
 
     let comment = null;
-    if (commentBody) {
+    const canonicalizedCommentBody = commentBody
+      ? await svc.canonicalizeCommentBody(issue.companyId, commentBody)
+      : commentBody;
+    if (canonicalizedCommentBody) {
       const commentReferenceSummaryBefore = updateReferenceSummaryAfter
         ?? await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      comment = await svc.addComment(id, commentBody, {
+      comment = await svc.addComment(id, canonicalizedCommentBody, {
         agentId: actor.agentId ?? undefined,
         userId: actor.actorType === "user" ? actor.actorId : undefined,
         runId: actor.runId,
@@ -3526,7 +3529,7 @@ export function issueRoutes(
         });
       }
 
-      if (commentBody && comment) {
+      if (canonicalizedCommentBody && comment) {
         const assigneeId = issue.assigneeAgentId;
         const actorIsAgent = actor.actorType === "agent";
         const selfComment = actorIsAgent && actor.actorId === assigneeId;
@@ -3563,7 +3566,7 @@ export function issueRoutes(
 
         let mentionedIds: string[] = [];
         try {
-          mentionedIds = await svc.findMentionedAgents(issue.companyId, commentBody);
+          mentionedIds = await svc.findMentionedAgents(issue.companyId, canonicalizedCommentBody);
         } catch (err) {
           logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
         }
@@ -4475,7 +4478,8 @@ export function issueRoutes(
       }
     }
 
-    const comment = await svc.addComment(id, req.body.body, {
+    const canonicalizedBody = await svc.canonicalizeCommentBody(issue.companyId, req.body.body);
+    const comment = await svc.addComment(id, canonicalizedBody, {
       agentId: actor.agentId ?? undefined,
       userId: actor.actorType === "user" ? actor.actorId : undefined,
       runId: actor.runId,
@@ -4601,7 +4605,7 @@ export function issueRoutes(
 
       let mentionedIds: string[] = [];
       try {
-        mentionedIds = await svc.findMentionedAgents(issue.companyId, req.body.body);
+        mentionedIds = await svc.findMentionedAgents(issue.companyId, canonicalizedBody);
       } catch (err) {
         logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
       }

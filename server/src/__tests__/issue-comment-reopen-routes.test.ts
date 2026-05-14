@@ -9,6 +9,7 @@ const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
   getDependencyReadiness: vi.fn(),
   findMentionedAgents: vi.fn(),
+  canonicalizeCommentBody: vi.fn(async (_companyId: string, body: string) => body),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
 }));
